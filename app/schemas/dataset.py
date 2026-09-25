@@ -212,6 +212,43 @@ class DatasetSubscriptionResponse(BaseModel):
     subscriber_team: str
     contact_person: Optional[str] = None
     notify_on_new_version: bool
+    status: str = "active"
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class DatasetSubscriptionResultResponse(DatasetSubscriptionResponse):
+    # created=首次订阅；already_active=重复请求；resumed=恢复订阅
+    result: str = Field(..., description="订阅结果：created/already_active/resumed")
+
+
+class DatasetSubscriptionEventResponse(BaseModel):
+    id: int
+    subscription_id: int
+    action: str
+    actor: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DatasetNotificationResponse(BaseModel):
+    id: int
+    dataset_id: int
+    dataset_version_id: int
+    subscription_id: int
+    subscriber_team: str
+    contact_person: Optional[str] = None
+    version_label: str
+    message: str
+    is_read: bool
+    read_at: Optional[datetime] = None
+    sent_at: Optional[datetime] = None
     created_at: datetime
 
     class Config:

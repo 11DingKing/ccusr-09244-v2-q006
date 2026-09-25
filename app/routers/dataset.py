@@ -7,16 +7,20 @@ from app.database import get_db
 from app.models import (
     Dataset, DatasetItem, DatasetReuse,
     DatasetVersion, DatasetReview, DatasetSubscription,
+    DatasetSubscriptionEvent,
     OperationData, Annotation, RobotModel, Scene
 )
 from app.services.aggregation import compute_dataset_quality_stats
+from app.services import subscription as subscription_service
 from app.schemas.dataset import (
     DatasetCreate, DatasetUpdate, DatasetResponse,
     DatasetItemAddRequest, DatasetItemRemoveRequest,
     DatasetReuseCreate, DatasetReuseResponse,
     DatasetVersionCreate, DatasetVersionResponse,
     DatasetReviewAction, DatasetReviewResponse,
-    DatasetSubscriptionCreate, DatasetSubscriptionResponse
+    DatasetSubscriptionCreate, DatasetSubscriptionResponse,
+    DatasetSubscriptionResultResponse, DatasetSubscriptionEventResponse,
+    DatasetNotificationResponse,
 )
 
 router = APIRouter()
@@ -57,43 +61,6 @@ def _snapshot_version_stats(dataset: Dataset) -> dict:
         "average_quality_score": dataset.average_quality_score,
         "data_grade": dataset.data_grade,
     }
-
-
-def _create_version_snapshot(db: Session, dataset: Dataset, change_description: str = None, created_by: str = None) -> DatasetVersion:
-    version_number = dataset.current_version
-    version_label = dataset.version
-    stats = _snapshot_version_stats(dataset)
-
-    version = DatasetVersion(
-        dataset_id=dataset.id,
-        version_number=version_number,
-        version_label=version_label,
-        change_description=change_description,
-        created_by=created_by,
-        **stats
-    )
-    db.add(version)
-    db.flush()
-    return version
-
-
-def _notify_subscribers(db: Session, dataset: Dataset, version: DatasetVersion):
-    subscriptions = db.query(DatasetSubscription).filter(
-        DatasetSubscription.dataset_id == dataset.id,
-        DatasetSubscription.notify_on_new_version == True
-    ).all()
-
-    notifications = []
-    for sub in subscriptions:
-        notifications.append({
-            "subscriber_team": sub.subscriber_team,
-            "contact_person": sub.contact_person,
-            "dataset_id": dataset.id,
-            "dataset_name": dataset.name,
-            "new_version": version.version_label,
-            "message": f"数据集 '{dataset.name}' 已发布新版本 {version.version_label}"
-        })
-    return notifications
 
 
 @router.get("/datasets", response_model=List[DatasetResponse], tags=["数据集管理"])
@@ -306,35 +273,29 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
             raise HTTPException(status_code=400, detail="数据集为空，无法提交审核")
         dataset.review_status = "pending_review"
         dataset.is_published = False
-
-    elif req.action == "approve":
-        dataset.review_status = "approved"
-        review = DatasetReview(
+        db.add(DatasetReview(
             dataset_id=dataset.id,
-            action="approve",
+            action="submit",
             reviewer=req.reviewer,
             review_notes=req.review_notes,
-        )
-        db.add(review)
-        db.flush()
-
-        version = _create_version_snapshot(
-            db, dataset,
-            change_description=req.review_notes or "审核通过，发布新版本",
-            created_by=req.reviewer
-        )
-        dataset.current_version = version.version_number
-        dataset.version = version.version_label
-
-        dataset.is_published = True
-        dataset.published_at = datetime.now(timezone.utc)
-
-        review.dataset_version_id = version.id
-        db.flush()
-
-        db.refresh(dataset)
-        _notify_subscribers(db, dataset, version)
+        ))
         db.commit()
+        db.refresh(dataset)
+        return db.query(DatasetReview).filter(
+            DatasetReview.dataset_id == dataset.id
+        ).order_by(DatasetReview.id.desc()).first()
+
+    elif req.action == "approve":
+        # 审核记录、版本快照、通知在同一事务内落库，共同成功或共同失败
+        dataset.review_status = "approved"
+        review, version, notifications = subscription_service.release_approved_dataset(
+            db, dataset, reviewer=req.reviewer, review_notes=req.review_notes
+        )
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
         db.refresh(review)
         return review
 
@@ -409,28 +370,17 @@ def create_dataset_version(dataset_id: int, req: DatasetVersionCreate, db: Sessi
     if dataset.review_status == "pending_review":
         raise HTTPException(status_code=400, detail="数据集正在审核中，无法创建新版本")
 
-    _create_version_snapshot(db, dataset, change_description=req.change_description, created_by=req.created_by)
-
-    dataset.current_version += 1
-    new_version_number = dataset.current_version
-    version_parts = dataset.version.split(".")
-    if len(version_parts) == 2:
-        minor = int(version_parts[1]) + 1
-        new_label = f"{version_parts[0]}.{minor}"
-    else:
-        new_label = str(new_version_number)
-    dataset.version = new_label
+    # 仅生成草稿版本快照，不发布、不通知；通知只在审核通过发布时产生
+    new_version = subscription_service.create_next_version(
+        db, dataset,
+        change_description=req.change_description,
+        created_by=req.created_by,
+    )
     dataset.review_status = "draft"
     dataset.is_published = False
     dataset.published_at = None
 
     db.commit()
-    db.flush()
-
-    new_version = db.query(DatasetVersion).filter(
-        DatasetVersion.dataset_id == dataset_id,
-        DatasetVersion.version_number == new_version_number
-    ).first()
     db.refresh(new_version)
     return new_version
 
@@ -456,29 +406,36 @@ def get_dataset_version(dataset_id: int, version_id: int, db: Session = Depends(
     return version
 
 
-@router.post("/datasets/{dataset_id}/subscriptions", response_model=DatasetSubscriptionResponse, tags=["数据集订阅"])
+@router.post("/datasets/{dataset_id}/subscriptions",
+             response_model=DatasetSubscriptionResultResponse, tags=["数据集订阅"])
 def subscribe_dataset(dataset_id: int, req: DatasetSubscriptionCreate, db: Session = Depends(get_db)):
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not dataset:
         raise HTTPException(status_code=404, detail="数据集不存在")
 
-    existing = db.query(DatasetSubscription).filter(
-        DatasetSubscription.dataset_id == dataset_id,
-        DatasetSubscription.subscriber_team == req.subscriber_team
-    ).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="该团队已订阅此数据集")
-
-    subscription = DatasetSubscription(
-        dataset_id=dataset_id,
+    subscription, result = subscription_service.subscribe(
+        db,
+        dataset,
         subscriber_team=req.subscriber_team,
         contact_person=req.contact_person,
-        notify_on_new_version=req.notify_on_new_version
+        notify_on_new_version=req.notify_on_new_version,
     )
-    db.add(subscription)
-    db.commit()
-    db.refresh(subscription)
-    return subscription
+    payload = DatasetSubscriptionResponse.model_validate(subscription).model_dump()
+    payload["result"] = result
+    return payload
+
+
+@router.delete("/datasets/{dataset_id}/subscriptions/by-team/{subscriber_team}",
+               tags=["数据集订阅"])
+def unsubscribe_dataset_by_team(dataset_id: int, subscriber_team: str, db: Session = Depends(get_db)):
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+
+    subscription = subscription_service.unsubscribe(db, dataset_id, subscriber_team)
+    if subscription is None:
+        raise HTTPException(status_code=404, detail="有效订阅不存在")
+    return {"message": "取消订阅成功", "subscription_id": subscription.id}
 
 
 @router.delete("/datasets/{dataset_id}/subscriptions/{subscription_id}", tags=["数据集订阅"])
@@ -489,19 +446,74 @@ def unsubscribe_dataset(dataset_id: int, subscription_id: int, db: Session = Dep
     ).first()
     if not subscription:
         raise HTTPException(status_code=404, detail="订阅不存在")
-    db.delete(subscription)
-    db.commit()
-    return {"message": "取消订阅成功"}
+
+    cancelled = subscription_service.unsubscribe(
+        db, dataset_id, subscription.subscriber_team
+    )
+    if cancelled is None:
+        raise HTTPException(status_code=400, detail="订阅已取消")
+    return {"message": "取消订阅成功", "subscription_id": cancelled.id}
 
 
-@router.get("/datasets/{dataset_id}/subscriptions", response_model=List[DatasetSubscriptionResponse], tags=["数据集订阅"])
-def list_dataset_subscriptions(dataset_id: int, db: Session = Depends(get_db)):
+@router.get("/datasets/{dataset_id}/subscriptions",
+            response_model=List[DatasetSubscriptionResponse], tags=["数据集订阅"])
+def list_dataset_subscriptions(
+    dataset_id: int,
+    active_only: bool = Query(False, description="仅返回有效订阅"),
+    db: Session = Depends(get_db)
+):
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not dataset:
         raise HTTPException(status_code=404, detail="数据集不存在")
-    return db.query(DatasetSubscription).filter(
+    query = db.query(DatasetSubscription).filter(
         DatasetSubscription.dataset_id == dataset_id
-    ).order_by(DatasetSubscription.created_at.desc()).all()
+    )
+    if active_only:
+        query = query.filter(DatasetSubscription.status == "active")
+    return query.order_by(DatasetSubscription.created_at.desc()).all()
+
+
+@router.get("/datasets/{dataset_id}/subscriptions/{subscription_id}/events",
+            response_model=List[DatasetSubscriptionEventResponse], tags=["数据集订阅"])
+def list_subscription_events(dataset_id: int, subscription_id: int, db: Session = Depends(get_db)):
+    subscription = db.query(DatasetSubscription).filter(
+        DatasetSubscription.id == subscription_id,
+        DatasetSubscription.dataset_id == dataset_id
+    ).first()
+    if not subscription:
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    return db.query(DatasetSubscriptionEvent).filter(
+        DatasetSubscriptionEvent.subscription_id == subscription_id
+    ).order_by(DatasetSubscriptionEvent.id.asc()).all()
+
+
+@router.get("/notifications",
+            response_model=List[DatasetNotificationResponse], tags=["通知"])
+def list_notifications(
+    subscriber_team: Optional[str] = Query(None, description="接收团队过滤"),
+    dataset_id: Optional[int] = Query(None, description="数据集ID过滤"),
+    unread_only: bool = Query(False, description="仅返回未读通知"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db)
+):
+    return subscription_service.list_notifications(
+        db,
+        subscriber_team=subscriber_team,
+        dataset_id=dataset_id,
+        unread_only=unread_only,
+        skip=skip,
+        limit=limit,
+    )
+
+
+@router.post("/notifications/{notification_id}/read",
+             response_model=DatasetNotificationResponse, tags=["通知"])
+def mark_notification_read(notification_id: int, db: Session = Depends(get_db)):
+    notification = subscription_service.mark_notification_read(db, notification_id)
+    if notification is None:
+        raise HTTPException(status_code=404, detail="通知不存在")
+    return notification
 
 
 @router.get("/datasets/{dataset_id}/reuses", response_model=List[DatasetReuseResponse], tags=["数据集复用"])

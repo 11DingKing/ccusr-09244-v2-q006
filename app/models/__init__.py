@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -177,6 +177,9 @@ class DatasetReuse(Base):
 
 class DatasetVersion(Base):
     __tablename__ = "dataset_versions"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "version_number", name="uq_dataset_version_number"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     dataset_id = Column(Integer, ForeignKey("datasets.id"), nullable=False, index=True)
@@ -214,13 +217,90 @@ class DatasetReview(Base):
 
 
 class DatasetSubscription(Base):
+    """同一接收方对同一数据集至多保留一条订阅记录。
+
+    取消订阅不删除行，仅将 status 置为 cancelled 并记录事件；重新订阅复用原行
+    （resumed），因此历史完整可查，且任一时刻 (dataset_id, subscriber_team) 只有
+    一条有效订阅。
+    """
+
     __tablename__ = "dataset_subscriptions"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "subscriber_team", name="uq_dataset_subscription"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     dataset_id = Column(Integer, ForeignKey("datasets.id"), nullable=False, index=True)
     subscriber_team = Column(String(100), nullable=False)
     contact_person = Column(String(100), nullable=True)
     notify_on_new_version = Column(Boolean, default=True)
+    status = Column(String(20), nullable=False, default="active", index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    cancelled_at = Column(DateTime(timezone=True), nullable=True)
 
     dataset = relationship("Dataset", back_populates="subscriptions")
+    events = relationship(
+        "DatasetSubscriptionEvent",
+        back_populates="subscription",
+        cascade="all, delete-orphan",
+        order_by="DatasetSubscriptionEvent.id",
+    )
+    notifications = relationship(
+        "DatasetNotification",
+        back_populates="subscription",
+        cascade="all, delete-orphan",
+    )
+
+
+class DatasetSubscriptionEvent(Base):
+    """订阅生命周期事件（subscribed / cancelled / resumed / resubscribed）。"""
+
+    __tablename__ = "dataset_subscription_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subscription_id = Column(
+        Integer, ForeignKey("dataset_subscriptions.id"), nullable=False, index=True
+    )
+    action = Column(String(20), nullable=False, index=True)
+    actor = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    subscription = relationship("DatasetSubscription", back_populates="events")
+
+
+class DatasetNotification(Base):
+    """版本发布时为有效订阅落库的通知。
+
+    每个 (dataset_version_id, subscription_id) 至多一条，重复发布或并发发布
+    只会产生一条可发送结果；通知随版本在同一事务中提交，共同成功或共同失败。
+    """
+
+    __tablename__ = "dataset_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_version_id",
+            "subscription_id",
+            name="uq_dataset_notification_version_subscription",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    dataset_id = Column(Integer, ForeignKey("datasets.id"), nullable=False, index=True)
+    dataset_version_id = Column(
+        Integer, ForeignKey("dataset_versions.id"), nullable=False, index=True
+    )
+    subscription_id = Column(
+        Integer, ForeignKey("dataset_subscriptions.id"), nullable=False, index=True
+    )
+    subscriber_team = Column(String(100), nullable=False, index=True)
+    contact_person = Column(String(100), nullable=True)
+    version_label = Column(String(20), nullable=False)
+    message = Column(Text, nullable=False)
+    is_read = Column(Boolean, nullable=False, default=False, index=True)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    subscription = relationship("DatasetSubscription", back_populates="notifications")
+    version = relationship("DatasetVersion")

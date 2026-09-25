@@ -14,8 +14,13 @@ data/*.db-journal
 data/*.mv.db
 data/*.trace.db
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 .mypy_cache/
 vendor/
 .phpunit.result.cache
