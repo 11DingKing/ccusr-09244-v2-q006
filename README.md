@@ -20,3 +20,10 @@
 ## 验证
 
 运行 `python3 -m pytest -q` 执行服务和领域工具测试，运行 `python3 -m compileall -q app main.py scripts` 检查编译。测试只使用临时 SQLite 数据库，不需要额外服务。
+
+## 订阅与通知语义
+
+- 同一接收方（`subscriber_team`）对同一数据集在任一时刻只有一条有效订阅；重复订阅幂等返回已有记录，接口通过 `result` 区分 `created`（首次订阅）、`duplicate`（重复请求）与 `restored`（恢复订阅）。
+- 取消订阅为软取消，保留订阅与通知历史；重新订阅在同一记录上恢复并递增订阅周期（`epoch`），取消前的旧通知不会随恢复复活。
+- 版本发布（审核通过）与通知落库在同一事务中提交，共同成功或共同失败；并发发布只有一个请求能成功，其余返回 409/400。
+- 通知按（版本， 订阅）唯一落库，可通过 `GET /api/v1/datasets/{id}/notifications` 追溯每条通知来自哪次订阅（`subscription_id` + `subscription_epoch`）；`GET /api/v1/notifications/unread?subscriber_team=...` 查询当前有效订阅的未读通知，`POST /api/v1/notifications/{id}/read` 标记已读。

@@ -1,12 +1,14 @@
 from typing import List, Optional
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import (
     Dataset, DatasetItem, DatasetReuse,
-    DatasetVersion, DatasetReview, DatasetSubscription,
+    DatasetVersion, DatasetReview, DatasetSubscription, DatasetNotification,
     OperationData, Annotation, RobotModel, Scene
 )
 from app.services.aggregation import compute_dataset_quality_stats
@@ -16,7 +18,8 @@ from app.schemas.dataset import (
     DatasetReuseCreate, DatasetReuseResponse,
     DatasetVersionCreate, DatasetVersionResponse,
     DatasetReviewAction, DatasetReviewResponse,
-    DatasetSubscriptionCreate, DatasetSubscriptionResponse
+    DatasetSubscriptionCreate, DatasetSubscriptionResponse,
+    DatasetSubscriptionActionResponse, DatasetNotificationResponse
 )
 
 router = APIRouter()
@@ -60,14 +63,17 @@ def _snapshot_version_stats(dataset: Dataset) -> dict:
 
 
 def _create_version_snapshot(db: Session, dataset: Dataset, change_description: str = None, created_by: str = None) -> DatasetVersion:
-    version_number = dataset.current_version
-    version_label = dataset.version
+    # 版本号按数据集内已有快照递增，配合 (dataset_id, version_number) 唯一约束，
+    # 保证并发创建时只有一个事务能成功
+    max_number = db.query(func.max(DatasetVersion.version_number)).filter(
+        DatasetVersion.dataset_id == dataset.id
+    ).scalar() or 0
     stats = _snapshot_version_stats(dataset)
 
     version = DatasetVersion(
         dataset_id=dataset.id,
-        version_number=version_number,
-        version_label=version_label,
+        version_number=max_number + 1,
+        version_label=dataset.version,
         change_description=change_description,
         created_by=created_by,
         **stats
@@ -77,22 +83,34 @@ def _create_version_snapshot(db: Session, dataset: Dataset, change_description: 
     return version
 
 
-def _notify_subscribers(db: Session, dataset: Dataset, version: DatasetVersion):
+def _create_version_notifications(db: Session, dataset: Dataset, version: DatasetVersion) -> List[DatasetNotification]:
+    """为当前有效订阅生成新版本通知并落库。
+
+    只在调用方的事务内写入，不单独提交：通知与版本发布共同成功或共同失败。
+    每个 (版本, 订阅) 最多一条通知，由唯一约束保证，重复发布不会产生重复通知。
+    """
     subscriptions = db.query(DatasetSubscription).filter(
         DatasetSubscription.dataset_id == dataset.id,
+        DatasetSubscription.status == "active",
         DatasetSubscription.notify_on_new_version == True
     ).all()
 
     notifications = []
     for sub in subscriptions:
-        notifications.append({
-            "subscriber_team": sub.subscriber_team,
-            "contact_person": sub.contact_person,
-            "dataset_id": dataset.id,
-            "dataset_name": dataset.name,
-            "new_version": version.version_label,
-            "message": f"数据集 '{dataset.name}' 已发布新版本 {version.version_label}"
-        })
+        notification = DatasetNotification(
+            dataset_id=dataset.id,
+            dataset_version_id=version.id,
+            subscription_id=sub.id,
+            subscriber_team=sub.subscriber_team,
+            contact_person=sub.contact_person,
+            subscription_epoch=sub.epoch,
+            version_label=version.version_label,
+            message=f"数据集 '{dataset.name}' 已发布新版本 {version.version_label}",
+            status="unread",
+        )
+        db.add(notification)
+        notifications.append(notification)
+    db.flush()
     return notifications
 
 
@@ -156,14 +174,7 @@ def create_dataset(data: DatasetCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(dataset)
 
-    version = DatasetVersion(
-        dataset_id=dataset.id,
-        version_number=1,
-        version_label=dataset.version,
-        change_description="初始版本",
-        **_snapshot_version_stats(dataset)
-    )
-    db.add(version)
+    _create_version_snapshot(db, dataset, change_description="初始版本")
     db.commit()
     db.refresh(dataset)
 
@@ -308,7 +319,17 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
         dataset.is_published = False
 
     elif req.action == "approve":
+        # 条件更新作为原子比较并交换：并发的 approve 只有一个能把
+        # pending_review 改为 approved，其余请求在此失败并回滚
+        updated = db.query(Dataset).filter(
+            Dataset.id == dataset.id,
+            Dataset.review_status == "pending_review"
+        ).update({Dataset.review_status: "approved"}, synchronize_session=False)
+        if updated != 1:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="数据集存在并发发布请求，本次操作已取消，请刷新后重试")
         dataset.review_status = "approved"
+
         review = DatasetReview(
             dataset_id=dataset.id,
             action="approve",
@@ -330,11 +351,14 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
         dataset.published_at = datetime.now(timezone.utc)
 
         review.dataset_version_id = version.id
-        db.flush()
 
-        db.refresh(dataset)
-        _notify_subscribers(db, dataset, version)
-        db.commit()
+        # 通知与版本发布在同一事务提交：共同成功或共同失败
+        _create_version_notifications(db, dataset, version)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="数据集发布冲突：版本或通知已存在，请刷新后重试")
         db.refresh(review)
         return review
 
@@ -409,30 +433,26 @@ def create_dataset_version(dataset_id: int, req: DatasetVersionCreate, db: Sessi
     if dataset.review_status == "pending_review":
         raise HTTPException(status_code=400, detail="数据集正在审核中，无法创建新版本")
 
-    _create_version_snapshot(db, dataset, change_description=req.change_description, created_by=req.created_by)
+    # 快照记录当前版本周期的最终状态，随后推进版本号进入下一周期
+    version = _create_version_snapshot(db, dataset, change_description=req.change_description, created_by=req.created_by)
+    dataset.current_version = version.version_number
 
-    dataset.current_version += 1
-    new_version_number = dataset.current_version
     version_parts = dataset.version.split(".")
-    if len(version_parts) == 2:
-        minor = int(version_parts[1]) + 1
-        new_label = f"{version_parts[0]}.{minor}"
+    if len(version_parts) == 2 and version_parts[1].isdigit():
+        dataset.version = f"{version_parts[0]}.{int(version_parts[1]) + 1}"
     else:
-        new_label = str(new_version_number)
-    dataset.version = new_label
+        dataset.version = str(version.version_number + 1)
     dataset.review_status = "draft"
     dataset.is_published = False
     dataset.published_at = None
 
-    db.commit()
-    db.flush()
-
-    new_version = db.query(DatasetVersion).filter(
-        DatasetVersion.dataset_id == dataset_id,
-        DatasetVersion.version_number == new_version_number
-    ).first()
-    db.refresh(new_version)
-    return new_version
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="版本创建冲突：存在并发请求，请刷新后重试")
+    db.refresh(version)
+    return version
 
 
 @router.get("/datasets/{dataset_id}/versions", response_model=List[DatasetVersionResponse], tags=["数据集版本"])
@@ -456,8 +476,20 @@ def get_dataset_version(dataset_id: int, version_id: int, db: Session = Depends(
     return version
 
 
-@router.post("/datasets/{dataset_id}/subscriptions", response_model=DatasetSubscriptionResponse, tags=["数据集订阅"])
-def subscribe_dataset(dataset_id: int, req: DatasetSubscriptionCreate, db: Session = Depends(get_db)):
+def _restore_subscription(db: Session, subscription: DatasetSubscription, req: DatasetSubscriptionCreate) -> DatasetSubscription:
+    """恢复已取消的订阅：复用原记录保留历史，周期递增，旧通知不随恢复复活。"""
+    subscription.status = "active"
+    subscription.epoch = (subscription.epoch or 0) + 1
+    subscription.cancelled_at = None
+    subscription.contact_person = req.contact_person
+    subscription.notify_on_new_version = req.notify_on_new_version
+    db.commit()
+    db.refresh(subscription)
+    return subscription
+
+
+@router.post("/datasets/{dataset_id}/subscriptions", response_model=DatasetSubscriptionActionResponse, tags=["数据集订阅"])
+def subscribe_dataset(dataset_id: int, req: DatasetSubscriptionCreate, response: Response, db: Session = Depends(get_db)):
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not dataset:
         raise HTTPException(status_code=404, detail="数据集不存在")
@@ -466,19 +498,43 @@ def subscribe_dataset(dataset_id: int, req: DatasetSubscriptionCreate, db: Sessi
         DatasetSubscription.dataset_id == dataset_id,
         DatasetSubscription.subscriber_team == req.subscriber_team
     ).first()
+
+    if existing and existing.status == "active":
+        # 重复请求：幂等返回已有订阅，不修改状态
+        return DatasetSubscriptionActionResponse(result="duplicate", subscription=existing)
     if existing:
-        raise HTTPException(status_code=400, detail="该团队已订阅此数据集")
+        subscription = _restore_subscription(db, existing, req)
+        return DatasetSubscriptionActionResponse(result="restored", subscription=subscription)
 
     subscription = DatasetSubscription(
         dataset_id=dataset_id,
         subscriber_team=req.subscriber_team,
         contact_person=req.contact_person,
-        notify_on_new_version=req.notify_on_new_version
+        notify_on_new_version=req.notify_on_new_version,
+        status="active",
+        epoch=1,
     )
     db.add(subscription)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发请求已抢先创建同一接收方的订阅，(dataset_id, subscriber_team)
+        # 唯一约束保证任一时刻只有一条记录，这里回滚后按已有记录返回
+        db.rollback()
+        existing = db.query(DatasetSubscription).filter(
+            DatasetSubscription.dataset_id == dataset_id,
+            DatasetSubscription.subscriber_team == req.subscriber_team
+        ).first()
+        if existing is None:
+            raise HTTPException(status_code=409, detail="订阅请求冲突，请重试")
+        if existing.status == "active":
+            return DatasetSubscriptionActionResponse(result="duplicate", subscription=existing)
+        subscription = _restore_subscription(db, existing, req)
+        return DatasetSubscriptionActionResponse(result="restored", subscription=subscription)
+
     db.refresh(subscription)
-    return subscription
+    response.status_code = 201
+    return DatasetSubscriptionActionResponse(result="created", subscription=subscription)
 
 
 @router.delete("/datasets/{dataset_id}/subscriptions/{subscription_id}", tags=["数据集订阅"])
@@ -489,19 +545,82 @@ def unsubscribe_dataset(dataset_id: int, subscription_id: int, db: Session = Dep
     ).first()
     if not subscription:
         raise HTTPException(status_code=404, detail="订阅不存在")
-    db.delete(subscription)
+    if subscription.status == "cancelled":
+        return {"message": "订阅已处于取消状态", "subscription_id": subscription.id, "status": "cancelled"}
+    # 软取消：保留订阅与通知历史，重新订阅时在同一记录上恢复
+    subscription.status = "cancelled"
+    subscription.cancelled_at = datetime.now(timezone.utc)
     db.commit()
-    return {"message": "取消订阅成功"}
+    return {"message": "取消订阅成功", "subscription_id": subscription.id, "status": "cancelled"}
 
 
 @router.get("/datasets/{dataset_id}/subscriptions", response_model=List[DatasetSubscriptionResponse], tags=["数据集订阅"])
-def list_dataset_subscriptions(dataset_id: int, db: Session = Depends(get_db)):
+def list_dataset_subscriptions(
+    dataset_id: int,
+    status: Optional[str] = Query(None, description="订阅状态过滤：active/cancelled"),
+    db: Session = Depends(get_db)
+):
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not dataset:
         raise HTTPException(status_code=404, detail="数据集不存在")
-    return db.query(DatasetSubscription).filter(
-        DatasetSubscription.dataset_id == dataset_id
-    ).order_by(DatasetSubscription.created_at.desc()).all()
+    if status is not None and status not in ("active", "cancelled"):
+        raise HTTPException(status_code=400, detail="无效的订阅状态，允许值：active/cancelled")
+    query = db.query(DatasetSubscription).filter(DatasetSubscription.dataset_id == dataset_id)
+    if status:
+        query = query.filter(DatasetSubscription.status == status)
+    return query.order_by(DatasetSubscription.created_at.desc()).all()
+
+
+@router.get("/datasets/{dataset_id}/notifications", response_model=List[DatasetNotificationResponse], tags=["数据集通知"])
+def list_dataset_notifications(
+    dataset_id: int,
+    status: Optional[str] = Query(None, description="通知状态过滤：unread/read"),
+    db: Session = Depends(get_db)
+):
+    """数据集的通知历史：包含已取消订阅周期的历史通知，可追溯每条通知来自哪次订阅。"""
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    if status is not None and status not in ("unread", "read"):
+        raise HTTPException(status_code=400, detail="无效的通知状态，允许值：unread/read")
+    query = db.query(DatasetNotification).filter(DatasetNotification.dataset_id == dataset_id)
+    if status:
+        query = query.filter(DatasetNotification.status == status)
+    return query.order_by(DatasetNotification.created_at.desc(), DatasetNotification.id.desc()).all()
+
+
+@router.get("/notifications/unread", response_model=List[DatasetNotificationResponse], tags=["数据集通知"])
+def list_unread_notifications(
+    subscriber_team: str = Query(..., description="订阅团队"),
+    db: Session = Depends(get_db)
+):
+    """接收方当前的未读通知。
+
+    只统计仍处于有效状态订阅的当前订阅周期内产生的通知：
+    取消订阅后旧通知不再出现，恢复订阅也不会复活取消前的通知。
+    """
+    return db.query(DatasetNotification).join(
+        DatasetSubscription,
+        DatasetNotification.subscription_id == DatasetSubscription.id
+    ).filter(
+        DatasetNotification.subscriber_team == subscriber_team,
+        DatasetNotification.status == "unread",
+        DatasetSubscription.status == "active",
+        DatasetNotification.subscription_epoch == DatasetSubscription.epoch
+    ).order_by(DatasetNotification.created_at.desc(), DatasetNotification.id.desc()).all()
+
+
+@router.post("/notifications/{notification_id}/read", response_model=DatasetNotificationResponse, tags=["数据集通知"])
+def mark_notification_read(notification_id: int, db: Session = Depends(get_db)):
+    notification = db.query(DatasetNotification).filter(DatasetNotification.id == notification_id).first()
+    if not notification:
+        raise HTTPException(status_code=404, detail="通知不存在")
+    if notification.status != "read":
+        notification.status = "read"
+        notification.read_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(notification)
+    return notification
 
 
 @router.get("/datasets/{dataset_id}/reuses", response_model=List[DatasetReuseResponse], tags=["数据集复用"])

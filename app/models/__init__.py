@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -145,6 +145,7 @@ class Dataset(Base):
     versions = relationship("DatasetVersion", back_populates="dataset", cascade="all, delete-orphan")
     reviews = relationship("DatasetReview", back_populates="dataset", cascade="all, delete-orphan")
     subscriptions = relationship("DatasetSubscription", back_populates="dataset", cascade="all, delete-orphan")
+    notifications = relationship("DatasetNotification", back_populates="dataset", cascade="all, delete-orphan")
 
 
 class DatasetItem(Base):
@@ -177,6 +178,9 @@ class DatasetReuse(Base):
 
 class DatasetVersion(Base):
     __tablename__ = "dataset_versions"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "version_number", name="uq_version_dataset_number"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     dataset_id = Column(Integer, ForeignKey("datasets.id"), nullable=False, index=True)
@@ -196,6 +200,7 @@ class DatasetVersion(Base):
 
     dataset = relationship("Dataset", back_populates="versions")
     reuse_records = relationship("DatasetReuse", back_populates="version")
+    notifications = relationship("DatasetNotification", back_populates="version", cascade="all, delete-orphan")
 
 
 class DatasetReview(Base):
@@ -215,12 +220,48 @@ class DatasetReview(Base):
 
 class DatasetSubscription(Base):
     __tablename__ = "dataset_subscriptions"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "subscriber_team", name="uq_subscription_dataset_team"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     dataset_id = Column(Integer, ForeignKey("datasets.id"), nullable=False, index=True)
     subscriber_team = Column(String(100), nullable=False)
     contact_person = Column(String(100), nullable=True)
     notify_on_new_version = Column(Boolean, default=True)
+    # active / cancelled：取消订阅只改状态不删记录，保留历史
+    status = Column(String(20), nullable=False, default="active", index=True)
+    # 订阅周期：每次从取消状态恢复订阅时递增，用于区分通知属于哪一次有效订阅
+    epoch = Column(Integer, nullable=False, default=1)
+    cancelled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     dataset = relationship("Dataset", back_populates="subscriptions")
+    notifications = relationship("DatasetNotification", back_populates="subscription", cascade="all, delete-orphan")
+
+
+class DatasetNotification(Base):
+    __tablename__ = "dataset_notifications"
+    __table_args__ = (
+        UniqueConstraint("dataset_version_id", "subscription_id", name="uq_notification_version_subscription"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    dataset_id = Column(Integer, ForeignKey("datasets.id"), nullable=False, index=True)
+    dataset_version_id = Column(Integer, ForeignKey("dataset_versions.id"), nullable=False, index=True)
+    subscription_id = Column(Integer, ForeignKey("dataset_subscriptions.id"), nullable=False, index=True)
+    subscriber_team = Column(String(100), nullable=False, index=True)
+    contact_person = Column(String(100), nullable=True)
+    # 生成通知时订阅所处的周期，配合订阅表当前 epoch 判断通知是否仍属于有效订阅
+    subscription_epoch = Column(Integer, nullable=False)
+    version_label = Column(String(20), nullable=False)
+    message = Column(Text, nullable=False)
+    # unread / read
+    status = Column(String(20), nullable=False, default="unread", index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    read_at = Column(DateTime(timezone=True), nullable=True)
+
+    dataset = relationship("Dataset", back_populates="notifications")
+    version = relationship("DatasetVersion", back_populates="notifications")
+    subscription = relationship("DatasetSubscription", back_populates="notifications")
